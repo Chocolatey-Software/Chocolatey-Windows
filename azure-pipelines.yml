@@ -1,0 +1,123 @@
+# Commit triggers
+trigger:
+- master
+
+# PR triggers
+pr:
+  branches:
+    include:
+    - master
+    - 'feature/*'
+  paths:
+    include:
+    - azure-pipelines.yml
+    - templates/*
+    - src/*
+    - schemas/JSON/manifests/*
+
+pool:
+  vmImage: 'windows-2025-vs2026'
+
+variables:
+  solution: 'src\AppInstallerCLI.sln'
+  nugetConfig: 'src\nuget.config'
+  EnableDetectorVcpkg: true
+
+# Do not set the build version for a PR build.
+
+jobs:
+- job: 'GetReleaseTag'
+  condition: not(eq(variables['Build.Reason'], 'PullRequest'))
+  variables:
+    runCodesignValidationInjection: ${{ false }}
+    skipComponentGovernanceDetection: ${{ true }}
+  steps:
+  - task: PowerShell@2
+    name: 'GetTag'
+    displayName: Get Release Tag
+    inputs:
+      filePath: 'src\binver\Update-BinVer.ps1'
+      arguments: '-OutVar'
+      workingDirectory: 'src'
+
+- template: templates/jobs-build.yml
+  parameters:
+    # Use custom agent with additional resources.
+    pool:
+      name: 1es-pool-winget
+
+- template: templates/jobs-test.yml
+
+- template: templates/jobs-powershell-module.yml
+
+- job: 'Fuzzing'
+  timeoutInMinutes: 60
+  condition: not(eq(variables['Build.Reason'], 'PullRequest'))
+  # Use custom agent with additional resources.
+  pool:
+    name: 1es-pool-winget
+
+  strategy:
+    matrix:
+      x64:
+        buildConfiguration: 'Fuzzing'
+        buildPlatform: 'x64'
+
+  variables:
+    buildOutDir: $(Build.SourcesDirectory)\src\$(buildPlatform)\$(buildConfiguration)
+    artifactsDir: $(Build.ArtifactStagingDirectory)\$(buildPlatform)
+
+  steps:
+  - task: NuGetToolInstaller@1
+    displayName: Install Nuget
+
+  - task: NuGetCommand@2
+    displayName: Restore Solution
+    inputs:
+      restoreSolution: '$(solution)'
+      feedsToUse: 'config'
+      nugetConfigPath: '$(nugetConfig)'
+
+  - task: CmdLine@2
+    displayName: Enable Vcpkg Install
+    inputs:
+      script: |
+        $(VCPKG_INSTALLATION_ROOT)\vcpkg.exe integrate install
+      workingDirectory: '$(VCPKG_INSTALLATION_ROOT)'
+
+  - task: VSBuild@1
+    displayName: Build Fuzzing Artifacts
+    inputs:
+      platform: '$(buildPlatform)'
+      solution: '$(solution)'
+      configuration: '$(buildConfiguration)'
+      msbuildArgs: '/bl:$(artifactsDir)\msbuild.binlog'
+      maximumCpuCount: true
+
+  - task: CopyFiles@2
+    displayName: Copy vcpkg logs
+    inputs:
+      SourceFolder: $(VCPKG_INSTALLATION_ROOT)\buildtrees
+      Contents: '**\*.log'
+      TargetFolder: '$(artifactsDir)\vcpkgLogs'
+    condition: succeededOrFailed()
+
+  - task: CopyFiles@2
+    displayName: Copy Fuzzing Artifacts for Publishing
+    inputs:
+      SourceFolder: '$(buildOutDir)\WinGetYamlFuzzing'
+      Contents: '**'
+      TargetFolder: '$(artifactsDir)'
+
+  - task: PublishPipelineArtifact@1
+    displayName: Publish Fuzzing Artifacts
+    inputs:
+      targetPath: '$(artifactsDir)'
+    condition: succeededOrFailed()
+
+  - task: onefuzz-task@0
+    inputs:
+      onefuzzOSes: 'Windows'
+    env:
+      onefuzzDropDirectory: '$(buildOutDir)\WinGetYamlFuzzing'
+      SYSTEM_ACCESSTOKEN: $(System.AccessToken)
